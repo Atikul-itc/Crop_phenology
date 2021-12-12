@@ -1,0 +1,253 @@
+//         Sentinel-2
+
+Map.addLayer(aoi);
+Map.centerObject(aoi, 14)
+
+var S1 = ee.ImageCollection('COPERNICUS/S1_GRD_FLOAT')
+    .filterBounds(aoi)
+    .filterDate('2018-10-01','2020-06-30')
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+    .filter(ee.Filter.eq('instrumentMode', 'IW'))
+    .filter(ee.Filter.eq('orbitProperties_pass', 'ASCENDING'));
+
+// Converting to Gamma naught
+var S1 = S1.map(function(image) {
+  return image.addBands(
+    image.select(0).subtract(image.select('angle').multiply(Math.PI/180.0).cos().log10().multiply(10.0)));
+})
+
+// Creating Cross ration (VH/VV)
+var S1 = S1.map(function(image) { return image.addBands(image.select('VH').divide(image.select('VV')).rename('CR')) })
+
+// Converting to db from natural number
+var S1_db = S1.map(function(image) {
+  var bands = image.bandNames().remove('angle');
+  var toDecibels = image.select(bands).log10().multiply(10);
+  return toDecibels.addBands(
+    image.select('angle').resample('bicubic')).set('system:time_start', image.get('system:time_start'));
+})
+
+print(S1);
+print(S1_db);
+
+// Charting the time series with polarization VV, VH and CR
+var C1 = ui.Chart.image.seriesByRegion(S1_db, aoi, ee.Reducer.mean(), 'VH' , 30, 'system:time_start')
+    .setChartType('ScatterChart')
+    .setOptions({
+      title: 'VH backscatter time series',
+      lineWidth: 0,
+      pointSize: 2,
+      vAxes: {
+        0: {title: 'VH (dB)'}
+      },
+      series: {
+        0: {targetAxisIndex: 0},
+        1: {targetAxisIndex: 0},
+        2: {targetAxisIndex: 0}
+      } 
+    });
+print(C1);
+
+var C2 = ui.Chart.image.seriesByRegion(S1_db, aoi, ee.Reducer.mean(), 'VV' , 30, 'system:time_start')
+    .setChartType('ScatterChart')
+    .setOptions({
+      title: 'VV backscatter time series',
+      lineWidth: 0,
+      pointSize: 2,
+      vAxes: {
+        0: {title: 'VV (dB)'}
+      },
+      series: {
+        0: {targetAxisIndex: 0},
+        1: {targetAxisIndex: 0},
+        2: {targetAxisIndex: 0}
+      } 
+    });
+print(C2);
+
+var C3 = ui.Chart.image.seriesByRegion(S1_db, aoi, ee.Reducer.mean(), 'CR' , 30, 'system:time_start')
+    .setChartType('ScatterChart')
+    .setOptions({
+      title: 'CR backscatter time series',
+      lineWidth: 0,
+      pointSize: 2,
+      vAxes: {
+        0: {title: 'CR (dB)'}
+      },
+      series: {
+        0: {targetAxisIndex: 0},
+        1: {targetAxisIndex: 0},
+        2: {targetAxisIndex: 0}
+      } 
+    });
+print(C3);
+
+//         Sentinel-2
+
+
+var timeField = 'system:time_start';
+
+var addVariables = function(image) {
+  // Compute time in fractional years since the epoch.
+  var date = ee.Date(image.get(timeField));
+  var years = date.difference(ee.Date('1970-01-01'), 'year');
+  // Return the image with the added bands.
+  return image
+    // Add a time band.
+    .addBands(ee.Image(years).rename('t').float())
+    // Add a constant band.
+    .addBands(ee.Image.constant(1));
+};
+
+// Cloud score
+// remove cloudy image
+var max_cloud_percent= 95;
+var sort_ascending = false;
+
+// Parameters for sentinel cloud score
+var cloudThresh = 20; //Ranges from 1-100. Lower value will mask more pixels out. Generally 10-30 works well with 20 being used most commonly 
+var cloudHeights = ee.List.sequence(200,10000,500); //Height of clouds is use to project cloud shadows
+var irSumThresh = 0.35; //Sum of IR bands to include as shadows within TDOM and the shadow shift method (lower number masks out less)
+var dilatePixels = 5; //Pixels to dilate around clouds
+var contractPixels = 1; //Pixels to reduce cloud mask and dark shadows by to reduce inclusion of single-pixel comission errors
+
+///////////////////////////////////////////
+// B / FUNCTIONS
+///////////////////////////////////////////
+
+var rescale = function(img, exp, thresholds) {
+    return img.expression(exp, {img: img})
+        .subtract(thresholds[0]).divide(thresholds[1] - thresholds[0]);
+  };
+
+function sentinelCloudScore(img) {
+  
+
+  // Compute several indicators of cloudyness and take the minimum of them.
+  var score = ee.Image(1);
+  
+  // Clouds are reasonably bright in the blue and cirrus bands.
+  score = score.min(rescale(img, 'img.blue', [0.1, 0.5]));
+  score = score.min(rescale(img, 'img.cb', [0.1, 0.3]));
+  score = score.min(rescale(img, 'img.cb + img.cirrus', [0.15, 0.2]));
+  
+  // Clouds are reasonably bright in all visible bands.
+  score = score.min(rescale(img, 'img.red + img.green + img.blue', [0.2, 0.8]));
+
+  
+  //Clouds are moist
+  var ndmi = img.normalizedDifference(['nir','swir1']);
+  score = score.min(rescale(ndmi, 'img', [-0.1, 0.1]));
+  
+  score = score.multiply(100).byte();
+ 
+  return img.addBands(score.rename('cloudScore'));
+}
+
+function projectShadows(cloudMask,image,cloudHeights){
+  var meanAzimuth = image.get('MEAN_SOLAR_AZIMUTH_ANGLE');
+  var meanZenith = image.get('MEAN_SOLAR_ZENITH_ANGLE');
+
+// Shadow mask 
+// Find dark pixels
+  var darkPixels = image.select(['nir','swir1','swir2']).reduce(ee.Reducer.sum()).lt(irSumThresh)
+    .focal_min(contractPixels).focal_max(dilatePixels)
+  ;//.gte(1);
+  
+    
+  //Get scale of image
+  var nominalScale = cloudMask.projection().nominalScale();
+
+  //Find where cloud shadows should be based on solar geometry
+  //Convert to radians , compute the sin of the cloud shadows.
+  var azR =ee.Number(meanAzimuth).multiply(Math.PI).divide(180.0).add(ee.Number(0.5).multiply(Math.PI ));
+  var zenR  =ee.Number(0.5).multiply(Math.PI ).subtract(ee.Number(meanZenith).multiply(Math.PI).divide(180.0));
+  
+  //Find the shadows
+  var shadows = cloudHeights.map(function(cloudHeight){
+    cloudHeight = ee.Number(cloudHeight);
+    
+    var shadowCastedDistance = zenR.tan().multiply(cloudHeight);//Distance shadow is cast
+    var x = azR.cos().multiply(shadowCastedDistance).divide(nominalScale).round();//X distance of shadow
+    var y = azR.sin().multiply(shadowCastedDistance).divide(nominalScale).round();//Y distance of shadow
+    return cloudMask.changeProj(cloudMask.projection(), cloudMask.projection().translate(x, y));
+  });
+
+  var shadowMask = ee.ImageCollection.fromImages(shadows).max();
+ 
+  //Create shadow mask
+  shadowMask = shadowMask.and(cloudMask.not());
+  shadowMask = shadowMask.and(darkPixels);
+  
+  var cloudShadowMask = shadowMask.or(cloudMask);
+  
+  image = image.updateMask(cloudShadowMask.not()).addBands(shadowMask.rename(['cloudShadowMask']));
+  return image;
+}
+
+//Function for wrapping the entire process to be applied across collection
+function wrapIt(img){
+  img = sentinelCloudScore(img);
+  var cloudMask = img.select(['cloudScore']).gt(cloudThresh)
+    .focal_min(contractPixels).focal_max(dilatePixels)
+
+  img = projectShadows(cloudMask,img,cloudHeights);
+  
+  return img;
+}
+
+// ADD AN "EVI" BAND
+function addEVI (img) {
+  var evi = img.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {
+        'NIR': img.select('nir'),
+        'RED': img.select('red'),
+        'BLUE': img.select('blue')});
+  return img.addBands(evi.float().rename('EVI'));
+}
+
+//Function to add date
+var addDate = function(img){
+   var date = img.date().format('YYYYMMdd');
+   return img.set('date', ee.Number.parse(date));
+};
+
+var s2 = ee.ImageCollection('COPERNICUS/S2').filterDate('2018-10-01','2020-06-30')  //
+                 .filterMetadata('CLOUDY_PIXEL_PERCENTAGE',"less_than",max_cloud_percent)
+                 .filterBounds(aoi)
+                 .sort('system:time_start')
+var s2 = s2.map(addDate);
+print(s2)
+
+var S2_noCloud = s2.map(function(img){
+    var t = img.select([ 'B1','B2','B3','B4','B5','B6','B7','B8','B8A', 'B9','B10', 'B11','B12']).divide(10000);//Rescale to 0-1
+    t = t.addBands(img.select(['QA60']));
+    var out = t.copyProperties(img).copyProperties(img,['system:time_start']);
+       return out;
+          })
+    .select(['QA60', 'B1','B2','B3','B4','B5','B6','B7','B8','B8A', 'B9','B10', 'B11','B12']
+    ,['QA60','cb', 'blue', 'green', 'red', 're1','re2','re3','nir', 'nir2', 'waterVapor', 'cirrus','swir1', 'swir2'])
+     .map(wrapIt);
+
+var S2_noCloud = S2_noCloud.map(addEVI);
+
+var evi = s2.select("EVI"); 
+print(S2_noCloud);
+
+var lsChart1 = ui.Chart.image.series(S2_noCloud.select('EVI'), aoi, ee.Reducer.mean(), 30)
+    .setChartType('ScatterChart')
+    .setOptions({
+      title: 'Sentinel-2 EVI time series for wheat field',
+      lineWidth: 0,
+      pointSize: 2,
+      vAxes: {
+        0: {title: 'EVI (-)'}
+      },
+      series: {
+        0: {targetAxisIndex: 0},
+        1: {targetAxisIndex: 0},
+        2: {targetAxisIndex: 0}
+      } 
+    });
+print(lsChart1);
